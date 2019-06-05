@@ -1,0 +1,462 @@
+// Copyright (C) 2019, ATA Engineering, Inc.
+// 
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU Lesser General Public
+// License as published by the Free Software Foundation; either
+// version 3 of the License, or (at your option) any later version.
+// 
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+// Lesser General Public License for more details.
+// 
+// You should have received a copy of the GNU Lesser General Public License
+// along with this program; if not, write to the Free Software Foundation,
+// Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+
+#include <Loci>
+#include "read_grid.h"
+#include "bctools.h"
+#include "qvi.h"
+
+#include <vector>
+#include <string>
+#include <iostream>
+#include <fstream>
+
+$include "chem.lh"
+
+using std::cout;
+using std::cerr;
+using std::endl;
+
+// print version when module is loaded
+namespace {
+  class PrintOnConstruct {
+  public:
+    PrintOnConstruct() {
+      if (Loci::MPI_rank == 0) {
+        cout << "CHEM transientWall version: 1.0.0 compiled on " << __DATE__
+             << " " << __TIME__ << endl;
+      }
+    }
+  };
+  PrintOnConstruct Instance;
+}
+
+
+// Set up boundary condition
+namespace chem {
+  // boundary condition checking
+  class transientWallBC_check : public BC_Check {
+    // This will contain the error message when an error is present
+    std::string error_message;
+
+   public:
+    // This contains a list of boundary conditions that this checker will
+    // check. If there are more than one, put commas between them.
+    std::string boundaryConditions() { return "viscousWall"; }
+
+    // Variables that will be involved with the check
+    std::string variablesChecked() { 
+      return "qwall,Twall,adiabatic,interface,prescribed,prescribed_qwall,transient"; 
+    }
+
+    // Check all the options given to viscousWall
+    // Transient option will work with adiabatic, qwall, or Twall options only
+    bool checkOptions(const options_list &bc_options) {
+      // only do check if transient is specified
+      if (bc_options.optionExists("transient")) {
+        error_message = "";
+        auto count = 0;
+        if (bc_options.optionExists("adiabatic")) count++;
+        if (bc_options.optionExists("qwall")) count++;
+        if (bc_options.optionExists("Twall")) count++;
+        if (count != 1) {
+          error_message =
+              "Must specify one of 'adiabatic', 'qwall', or 'Twall'";
+          return false;
+        }
+
+        if (bc_options.optionExists("prescribed")) {
+          error_message =
+              "'prescribed' option not supported for transient wall";
+          return false;
+        }
+        if (bc_options.optionExists("prescribed_qwall")) {
+          error_message =
+              "'prescribed_qwall' option not supported for transient wall";
+          return false;
+        }
+        if (bc_options.optionExists("interface")) {
+          error_message = "'interface' option not supported for transient wall";
+          return false;
+        }
+
+        // do specific checks if wall is adiabatic
+        if (bc_options.optionExists("adiabatic")) {
+          if (bc_options.getOptionValueType("adiabatic") == Loci::STRING) {
+            std::string filename;
+            bc_options.getOption("adiabatic", filename);
+            std::ifstream file(filename);
+            if (file.fail()) {
+              error_message = "unable to open file '" + filename;
+              error_message += "' given by 'adiabatic' option";
+              return false;
+            }
+            return true;
+          }
+          error_message =
+              "'adiabatic' should be assigned the filename of the time "
+              "prescribed data file";
+          return false;
+        }
+
+        // do specific checks if wall is isothermal
+        if (bc_options.optionExists("Twall")) {
+          if (bc_options.getOptionValueType("Twall") == Loci::STRING) {
+            std::string filename;
+            bc_options.getOption("Twall", filename);
+            std::ifstream file(filename);
+            if (file.fail()) {
+              error_message = "unable to open file '" + filename;
+              error_message += "' given by 'Twall' option";
+              return false;
+            }
+            return true;
+          }
+          error_message =
+              "'Twall' should be assigned the filename of the time prescribed "
+              "data file";
+          return false;
+        }
+
+        // do specific checks if wall is isoflux
+        if (bc_options.optionExists("qwall")) {
+          if (bc_options.getOptionValueType("qwall") == Loci::STRING) {
+            std::string filename;
+            bc_options.getOption("qwall", filename);
+            std::ifstream file(filename);
+            if (file.fail()) {
+              error_message = "unable to open file '" + filename;
+              error_message += "' given by 'qwall' option";
+              return false;
+            }
+            return true;
+          }
+          error_message =
+              "'qwall' should be assigned the filename of the time prescribed "
+              "data file";
+          return false;
+        }
+
+      }
+      return true;
+    }
+
+    std::ostream &ErrorMessage(std::ostream &s) {
+      s << error_message << endl;
+      return s;
+    }
+  };
+
+  // Register the bc check
+  register_BC<transientWallBC_check> register_BC_transientWallBC_check;
+
+  // Data structure for storing the time prescribed data for adiabatic wall
+  struct prescribed_adiabatic_wall_data {
+    double time;
+    vect3d vel;
+
+    void ReadFromFile(std::ifstream &file) {
+      file >> time >> vel.x >> vel.y >> vel.z;
+    }
+    void InterpSpecialData(const prescribed_adiabatic_wall_data &d0,
+                           const prescribed_adiabatic_wall_data &d1,
+                           const double &s, const double &t) {}
+  };
+
+  // provide stream operators for Loci
+  std::ostream &operator<<(std::ostream &s,
+                           const prescribed_adiabatic_wall_data &d) {
+    s << d.time << ' ' << d.vel.x << ' ' << d.vel.y << ' ' << d.vel.z << ' '
+      << endl;
+    return s;
+  }
+
+  std::istream &operator>>(std::istream &s, prescribed_adiabatic_wall_data &d) {
+    s >> d.time >> d.vel.x >> d.vel.y >> d.vel.z;
+    return s;
+  }
+
+  // Data structure for storing the time prescribed data for isothermal wall
+  struct prescribed_isothermal_wall_data {
+    double time;
+    double T;
+    vect3d vel;
+
+    void ReadFromFile(std::ifstream &file) {
+      file >> time >> T >> vel.x >> vel.y >> vel.z;
+    }
+    void InterpSpecialData(const prescribed_isothermal_wall_data &d0,
+                           const prescribed_isothermal_wall_data &d1,
+                           const double &s, const double &t) {
+      T = d0.T * s + d1.T * t;
+    }
+  };
+
+  // provide stream operators for Loci
+  std::ostream &operator<<(std::ostream &s,
+                           const prescribed_isothermal_wall_data &d) {
+    s << d.time << ' ' << d.T << ' ' << d.vel.x << ' ' << d.vel.y << ' '
+      << d.vel.z << endl;
+    return s;
+  }
+
+  std::istream &operator>>(std::istream &s,
+                           prescribed_isothermal_wall_data &d) {
+    s >> d.time >> d.T >> d.vel.x >> d.vel.y >> d.vel.z;
+    return s;
+  }
+
+  // Data structure for storing the time prescribed data for isoflux wall
+  struct prescribed_q_wall_data {
+    double time;
+    double q;
+    vect3d vel;
+
+    void ReadFromFile(std::ifstream &file) {
+      file >> time >> q >> vel.x >> vel.y >> vel.z;
+    }
+    void InterpSpecialData(const prescribed_q_wall_data &d0,
+                           const prescribed_q_wall_data &d1,
+                           const double &s, const double &t) {
+      q = d0.q * s + d1.q * t;
+    }
+  };
+
+  // provide stream operators for Loci
+  std::ostream &operator<<(std::ostream &s, const prescribed_q_wall_data &d) {
+    s << d.time << ' ' << d.q << ' ' << d.vel.x << ' ' << d.vel.y << ' '
+      << d.vel.z << endl;
+    return s;
+  }
+
+  std::istream &operator>>(std::istream &s, prescribed_q_wall_data &d) {
+    s >> d.time >> d.q >> d.vel.x >> d.vel.y >> d.vel.z;
+    return s;
+  }
+
+  // templated function to interpolate data in time for adiabatic, isothermal,
+  // and isoflux walls
+  template <typename T>
+  T InterpData(const T &d0, const T &d1, const double &time) {
+    auto t = (time - d0.time) / (d1.time - d0.time);
+    auto s = 1. - t;
+
+    T interp;
+    interp.time = time;
+    interp.vel.x = d0.vel.x * s + d1.vel.x * t;
+    interp.vel.y = d0.vel.y * s + d1.vel.y * t;
+    interp.vel.z = d0.vel.z * s + d1.vel.z * t;
+    interp.InterpSpecialData(d0, d1, s, t);
+    return interp;
+  }
+
+}  // end namespace chem
+
+// ----------------------------------------------------------------------
+namespace Loci {
+  // This allows us to put the prescribed wall data into a Loci container
+  template<> struct data_schema_traits<chem::prescribed_adiabatic_wall_data> {
+    typedef IDENTITY_CONVERTER Schema_Converter;
+    static DatatypeP get_type() {
+      CompoundDatatypeP ct =
+          CompoundFactory(chem::prescribed_adiabatic_wall_data());
+      LOCI_INSERT_TYPE(ct, chem::prescribed_adiabatic_wall_data, time);
+      LOCI_INSERT_TYPE(ct, chem::prescribed_adiabatic_wall_data, vel);
+      return DatatypeP(ct);
+    }
+  };
+
+  template<> struct data_schema_traits<chem::prescribed_isothermal_wall_data> {
+    typedef IDENTITY_CONVERTER Schema_Converter;
+    static DatatypeP get_type() {
+      CompoundDatatypeP ct =
+          CompoundFactory(chem::prescribed_isothermal_wall_data());
+      LOCI_INSERT_TYPE(ct, chem::prescribed_isothermal_wall_data, time);
+      LOCI_INSERT_TYPE(ct, chem::prescribed_isothermal_wall_data, T);
+      LOCI_INSERT_TYPE(ct, chem::prescribed_isothermal_wall_data, vel);
+      return DatatypeP(ct);
+    }
+  };
+
+  template<> struct data_schema_traits<chem::prescribed_q_wall_data> {
+    typedef IDENTITY_CONVERTER Schema_Converter;
+    static DatatypeP get_type() {
+      CompoundDatatypeP ct = CompoundFactory(chem::prescribed_q_wall_data());
+      LOCI_INSERT_TYPE(ct, chem::prescribed_q_wall_data, time);
+      LOCI_INSERT_TYPE(ct, chem::prescribed_q_wall_data, q);
+      LOCI_INSERT_TYPE(ct, chem::prescribed_q_wall_data, vel);
+      return DatatypeP(ct);
+    }
+  };
+
+}  // end namespace Loci
+
+// ----------------------------------------------------------------------
+namespace chem {
+
+  // This routine reads a time series for a viscous wall out of a file
+  // The format of the file is as follows:
+  // NT - number of time data
+  // for(ii=0; ii<NT; ++ii) {
+  //   time u v w
+  // or
+  //   time T u v w
+  // or 
+  //   time q u v w
+  template <typename T>
+  void read_time_series(std::string filename, std::vector<T> &data) {
+    // read file name
+    std::ifstream file(filename);
+    if (file.fail()) {
+      cerr << "unable to read '" << filename << "'" << endl;
+      Loci::Abort();
+    }
+
+    // read number of time steps
+    auto numData = 0;
+    file >> numData;
+    data.clear();
+
+    // loop over all time steps
+    for (auto ii = 0; ii < numData; ++ii) {
+      // read in time and fluid state quantities for time step
+      data.push_back(T());
+      data.back().ReadFromFile(file);
+    }
+  }
+
+  // Compute interpolated values for a given time, use linear search to find
+  // time interval
+  template <typename T>
+  T interpolate_time(const std::vector<T> &timeset, real time) {
+    // if time is less than first time point for which there is data, use zeroth
+    // order extrapolation and return the data at the first time point
+    if (time <= timeset[0].time) {
+      return timeset[0];
+    }
+
+    // if time is greater than last time point for which there is data, use
+    // zeroth order extrapolation and return the data at the last time point
+    if (time >= timeset.back().time) {
+      return timeset.back();
+    }
+
+    // if time is between two given time points, linearly interpolate for data
+    // at given time
+    for (auto ii = 0U; ii < timeset.size() - 1; ++ii) {
+      if (time >= timeset[ii].time && time <= timeset[ii + 1].time) {
+        return InterpData(timeset[ii], timeset[ii + 1], time);
+      }
+    }
+
+    // if we made it here, there was a problem with the interpolation
+    cerr << "ERROR: Problem with interpolation for transient wall data" << endl;
+    Loci::Abort();
+    return T();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Rules start here
+  $type transient_BCoption Constraint;
+
+  // Read in the filename from adiabatic option and
+  // put the adiabatic file information into Loci containers
+  $type adiabatic_prescribed store<std::vector<prescribed_adiabatic_wall_data>>;
+  $rule pointwise(adiabatic_prescribed <- qvi, BC_options),
+      constraint(adiabatic_BCoption, transient_BCoption) {
+    std::string filename;
+    $BC_options.getOption("adiabatic", filename);
+    read_time_series(filename, $adiabatic_prescribed);
+  }
+
+  // Read in the filename from isothermal option and
+  // put the isothermal file information into Loci containers
+  $type isothermal_prescribed store<std::vector<prescribed_isothermal_wall_data>>;
+  $rule pointwise(isothermal_prescribed <- qvi, BC_options),
+      constraint(Twall_BCoption, transient_BCoption) {
+    std::string filename;
+    $BC_options.getOption("Twall", filename);
+    read_time_series(filename, $isothermal_prescribed);
+  }
+
+  // Read in the filename from isoflux option and
+  // put the isoflux file information into Loci containers
+  $type heatFlux_prescribed store<std::vector<prescribed_q_wall_data>>;
+  $rule pointwise(heatFlux_prescribed <- qvi, BC_options),
+      constraint(qwall_BCoption, transient_BCoption) {
+    std::string filename;
+    $BC_options.getOption("qwall", filename);
+    read_time_series(filename, $heatFlux_prescribed);
+  }
+
+  $type uInTime store<vect3d>;
+  $type TInTime store<real>;
+  $type qInTime store<real>;
+
+  // Compute the transient wall bc conditions at a specific time
+  $rule pointwise(uInTime, qInTime <- stime, adiabatic_prescribed) {
+    // interpolate data to current time
+    auto val = interpolate_time($adiabatic_prescribed, $stime);
+    $qInTime = 0.0;
+    $uInTime.x = val.vel.x;
+    $uInTime.y = val.vel.y;
+    $uInTime.z = val.vel.z;
+  }
+
+  $rule pointwise(uInTime, TInTime <- stime, isothermal_prescribed) {
+    // interpolate data to current time
+    auto val = interpolate_time($isothermal_prescribed, $stime);
+    $TInTime = val.T;
+    $uInTime.x = val.vel.x;
+    $uInTime.y = val.vel.y;
+    $uInTime.z = val.vel.z;
+  }
+
+  $rule pointwise(uInTime, qInTime <- stime, heatFlux_prescribed) {
+    // interpolate data to current time
+    auto val = interpolate_time($heatFlux_prescribed, $stime);
+    $qInTime = val.q;
+    $uInTime.x = val.vel.x;
+    $uInTime.y = val.vel.y;
+    $uInTime.z = val.vel.z;
+  }
+
+  $type Twall store<real>;
+  $type qwall store<real>;
+  $type wallVelocity store<vect3d>;
+
+  // Assigns the transient value to the faces of the boundary
+  $rule pointwise(transient::wallVelocity, transient::qwall <- ref->(uInTime)),
+      constraint(viscousWall_BC, ref->transient_BCoption,
+                 ref->adiabatic_BCoption) {
+    $wallVelocity = $ref->$uInTime;
+    $qwall = 0.0;
+  }
+
+  $rule pointwise(transient::wallVelocity,
+                  transient::Twall <- ref->(uInTime, TInTime)),
+      constraint(viscousWall_BC, ref->transient_BCoption, ref->Twall_BCoption) {
+    $wallVelocity = $ref->$uInTime;
+    $Twall = $ref->$TInTime;
+  }
+
+  $rule pointwise(transient::wallVelocity,
+                  transient::qwall < -ref->(uInTime, qInTime)),
+      constraint(viscousWall_BC, ref->transient_BCoption, ref->qwall_BCoption) {
+    $wallVelocity = $ref->$uInTime;
+    $qwall = $ref->$qInTime;
+  }
+}
